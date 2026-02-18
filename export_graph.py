@@ -198,6 +198,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Neo4j database (default: {DEFAULT_DATABASE}). Env: NEO4J_DATABASE",
     )
     parser.add_argument(
+        "-o", "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for exported files (default: current directory). Env: OUTPUT_DIR",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
@@ -224,11 +230,14 @@ def resolve_config(args: argparse.Namespace) -> dict:
     if not password:
         password = getpass.getpass(prompt="Neo4j password: ")
 
+    output_dir = args.output_dir or os.getenv("OUTPUT_DIR", ".")
+
     return {
         "uri": uri,
         "username": username,
         "password": password,
         "database": database,
+        "output_dir": output_dir,
     }
 
 
@@ -237,9 +246,12 @@ def main() -> None:
     config = resolve_config(args)
     batch_size: int = args.batch_size
 
-    nodes_path = "nodes.parquet"
-    rels_path = "relationships.parquet"
-    schema_path = "schema.cypher"
+    output_dir = config["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    nodes_path = os.path.join(output_dir, "nodes.parquet")
+    rels_path = os.path.join(output_dir, "relationships.parquet")
+    schema_path = os.path.join(output_dir, "schema.cypher")
 
     _check_output_files([nodes_path, rels_path, schema_path], args.overwrite)
 
