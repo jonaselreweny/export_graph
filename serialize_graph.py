@@ -67,6 +67,24 @@ def fetch_relationships(session) -> pa.Table:
     )
 
 
+def fetch_constraints(session) -> list[str]:
+    """Return CREATE statements for all constraints."""
+    result = session.run(
+        "SHOW CONSTRAINTS YIELD createStatement RETURN createStatement"
+    )
+    return [record["createStatement"] for record in result]
+
+
+def fetch_indexes(session) -> list[str]:
+    """Return CREATE statements for indexes that are NOT owned by a constraint."""
+    result = session.run(
+        "SHOW INDEXES YIELD owningConstraint, createStatement "
+        "WHERE owningConstraint IS NULL "
+        "RETURN createStatement"
+    )
+    return [record["createStatement"] for record in result]
+
+
 def main() -> None:
     driver = GraphDatabase.driver(URI, auth=AUTH)
     driver.verify_connectivity()
@@ -75,12 +93,30 @@ def main() -> None:
     with driver.session(database=DATABASE) as session:
         nodes_table = fetch_nodes(session)
         rels_table = fetch_relationships(session)
+        constraint_stmts = fetch_constraints(session)
+        index_stmts = fetch_indexes(session)
 
     pq.write_table(nodes_table, "nodes.parquet")
     print(f"Wrote {nodes_table.num_rows} nodes  → nodes.parquet")
 
     pq.write_table(rels_table, "relationships.parquet")
     print(f"Wrote {rels_table.num_rows} relationships → relationships.parquet")
+
+    schema_path = "schema.cypher"
+    with open(schema_path, "w") as f:
+        if constraint_stmts:
+            f.write("// Constraints\n")
+            for stmt in constraint_stmts:
+                f.write(f"{stmt};\n")
+            f.write("\n")
+        if index_stmts:
+            f.write("// Indexes\n")
+            for stmt in index_stmts:
+                f.write(f"{stmt};\n")
+    print(
+        f"Wrote {len(constraint_stmts)} constraint(s) and "
+        f"{len(index_stmts)} index(es) → {schema_path}"
+    )
 
     driver.close()
 
