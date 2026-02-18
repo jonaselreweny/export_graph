@@ -1,4 +1,4 @@
-"""Serialize a Neo4j property graph to Parquet files (nodes + relationships)."""
+"""Export a Neo4j property graph to Parquet files (nodes + relationships) and schema."""
 
 import json
 
