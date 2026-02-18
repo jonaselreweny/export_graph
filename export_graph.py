@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import os
+import time
 from collections.abc import Generator
 
 import pyarrow as pa
@@ -10,7 +12,8 @@ from neo4j import GraphDatabase
 
 URI = "bolt+ssc://localhost:7687"
 AUTH = ("neo4j", "test1234")
-DATABASE = "movies"  # set to None to use the default database
+DATABASE = "paysim"  # set to None to use the default database
+DEFAULT_BATCH_SIZE = 50_000
 
 
 def _serialize_props(props: dict) -> str:
@@ -23,6 +26,7 @@ NODES_SCHEMA = pa.schema(
         pa.field("id", pa.string()),
         pa.field("labels", pa.string()),
         pa.field("properties", pa.string()),
+        pa.field("property_types", pa.string()),
     ]
 )
 
@@ -32,24 +36,29 @@ RELATIONSHIPS_SCHEMA = pa.schema(
         pa.field("inId", pa.string()),
         pa.field("type", pa.string()),
         pa.field("properties", pa.string()),
+        pa.field("property_types", pa.string()),
     ]
 )
 
 
-def fetch_nodes(session, batch_size: int = 1000) -> Generator[pa.Table, None, None]:
-    """Yield batches of nodes as PyArrow tables with columns: id, labels, properties."""
+def fetch_nodes(session, batch_size: int = DEFAULT_BATCH_SIZE) -> Generator[pa.Table, None, None]:
+    """Yield batches of nodes as PyArrow tables with columns: id, labels, properties, property_types."""
     result = session.run(
         "MATCH (n) "
-        "RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props"
+        "RETURN elementId(n) AS id, labels(n) AS labels, "
+        "properties(n) AS props, "
+        "apoc.meta.cypher.types(properties(n)) AS propTypes"
     )
     ids: list[str] = []
     labels: list[str] = []
     properties: list[str] = []
+    property_types: list[str] = []
 
     for record in result:
         ids.append(record["id"])
         labels.append(json.dumps(record["labels"]))
         properties.append(_serialize_props(record["props"]))
+        property_types.append(json.dumps(record["propTypes"]))
 
         if len(ids) >= batch_size:
             yield pa.table(
@@ -57,11 +66,13 @@ def fetch_nodes(session, batch_size: int = 1000) -> Generator[pa.Table, None, No
                     "id": pa.array(ids, type=pa.string()),
                     "labels": pa.array(labels, type=pa.string()),
                     "properties": pa.array(properties, type=pa.string()),
+                    "property_types": pa.array(property_types, type=pa.string()),
                 }
             )
             ids.clear()
             labels.clear()
             properties.clear()
+            property_types.clear()
 
     if ids:
         yield pa.table(
@@ -69,29 +80,33 @@ def fetch_nodes(session, batch_size: int = 1000) -> Generator[pa.Table, None, No
                 "id": pa.array(ids, type=pa.string()),
                 "labels": pa.array(labels, type=pa.string()),
                 "properties": pa.array(properties, type=pa.string()),
+                "property_types": pa.array(property_types, type=pa.string()),
             }
         )
 
 
 def fetch_relationships(
-    session, batch_size: int = 1000
+    session, batch_size: int = DEFAULT_BATCH_SIZE
 ) -> Generator[pa.Table, None, None]:
-    """Yield batches of relationships as PyArrow tables with columns: outId, inId, type, properties."""
+    """Yield batches of relationships as PyArrow tables with columns: outId, inId, type, properties, property_types."""
     result = session.run(
         "MATCH (a)-[r]->(b) "
         "RETURN elementId(a) AS outId, elementId(b) AS inId, "
-        "type(r) AS type, properties(r) AS props"
+        "type(r) AS type, properties(r) AS props, "
+        "apoc.meta.cypher.types(properties(r)) AS propTypes"
     )
     out_ids: list[str] = []
     in_ids: list[str] = []
     types: list[str] = []
     properties: list[str] = []
+    property_types: list[str] = []
 
     for record in result:
         out_ids.append(record["outId"])
         in_ids.append(record["inId"])
         types.append(record["type"])
         properties.append(_serialize_props(record["props"]))
+        property_types.append(json.dumps(record["propTypes"]))
 
         if len(out_ids) >= batch_size:
             yield pa.table(
@@ -100,12 +115,14 @@ def fetch_relationships(
                     "inId": pa.array(in_ids, type=pa.string()),
                     "type": pa.array(types, type=pa.string()),
                     "properties": pa.array(properties, type=pa.string()),
+                    "property_types": pa.array(property_types, type=pa.string()),
                 }
             )
             out_ids.clear()
             in_ids.clear()
             types.clear()
             properties.clear()
+            property_types.clear()
 
     if out_ids:
         yield pa.table(
@@ -114,6 +131,7 @@ def fetch_relationships(
                 "inId": pa.array(in_ids, type=pa.string()),
                 "type": pa.array(types, type=pa.string()),
                 "properties": pa.array(properties, type=pa.string()),
+                "property_types": pa.array(property_types, type=pa.string()),
             }
         )
 
@@ -136,6 +154,18 @@ def fetch_indexes(session) -> list[str]:
     return [record["createStatement"] for record in result]
 
 
+def _check_output_files(paths: list[str], overwrite: bool) -> None:
+    """Exit with an error if any output file already exists and overwrite is False."""
+    if overwrite:
+        return
+    existing = [p for p in paths if os.path.exists(p)]
+    if existing:
+        raise SystemExit(
+            f"Output file(s) already exist: {', '.join(existing)}. "
+            "Use --overwrite to replace them."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -144,8 +174,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1000,
-        help="Number of nodes/relationships to fetch per batch (default: 1000).",
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Number of nodes/relationships to fetch per batch (default: {DEFAULT_BATCH_SIZE}).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="Overwrite existing output files. Without this flag, the script exits if files exist.",
     )
     return parser.parse_args()
 
@@ -154,6 +190,12 @@ def main() -> None:
     args = parse_args()
     batch_size: int = args.batch_size
 
+    nodes_path = "nodes.parquet"
+    rels_path = "relationships.parquet"
+    schema_path = "schema.cypher"
+
+    _check_output_files([nodes_path, rels_path, schema_path], args.overwrite)
+
     driver = GraphDatabase.driver(URI, auth=AUTH)
     driver.verify_connectivity()
     print(f"Connected to Neo4j.  Batch size: {batch_size}")
@@ -161,29 +203,46 @@ def main() -> None:
     with driver.session(database=DATABASE) as session:
         # --- Nodes ---
         total_nodes = 0
-        nodes_path = "nodes.parquet"
+        nodes_start = time.perf_counter()
+        batch_start = nodes_start
         with pq.ParquetWriter(nodes_path, NODES_SCHEMA) as writer:
             for batch in fetch_nodes(session, batch_size):
                 writer.write_table(batch)
                 total_nodes += batch.num_rows
-                print(f"  nodes: wrote batch of {batch.num_rows} (total: {total_nodes})")
-        print(f"Wrote {total_nodes} nodes → {nodes_path}")
+                batch_elapsed = time.perf_counter() - batch_start
+                batch_rate = batch.num_rows / batch_elapsed if batch_elapsed > 0 else 0
+                print(
+                    f"  nodes: wrote batch of {batch.num_rows} "
+                    f"(total: {total_nodes}, {batch_rate:,.0f} nodes/s)"
+                )
+                batch_start = time.perf_counter()
+        nodes_elapsed = time.perf_counter() - nodes_start
+        nodes_rate = total_nodes / nodes_elapsed if nodes_elapsed > 0 else 0
+        print(f"Wrote {total_nodes} nodes → {nodes_path} ({nodes_rate:,.0f} nodes/s)")
 
         # --- Relationships ---
         total_rels = 0
-        rels_path = "relationships.parquet"
+        rels_start = time.perf_counter()
+        batch_start = rels_start
         with pq.ParquetWriter(rels_path, RELATIONSHIPS_SCHEMA) as writer:
             for batch in fetch_relationships(session, batch_size):
                 writer.write_table(batch)
                 total_rels += batch.num_rows
-                print(f"  rels: wrote batch of {batch.num_rows} (total: {total_rels})")
-        print(f"Wrote {total_rels} relationships → {rels_path}")
+                batch_elapsed = time.perf_counter() - batch_start
+                batch_rate = batch.num_rows / batch_elapsed if batch_elapsed > 0 else 0
+                print(
+                    f"  rels: wrote batch of {batch.num_rows} "
+                    f"(total: {total_rels}, {batch_rate:,.0f} rels/s)"
+                )
+                batch_start = time.perf_counter()
+        rels_elapsed = time.perf_counter() - rels_start
+        rels_rate = total_rels / rels_elapsed if rels_elapsed > 0 else 0
+        print(f"Wrote {total_rels} relationships → {rels_path} ({rels_rate:,.0f} rels/s)")
 
         # --- Schema ---
         constraint_stmts = fetch_constraints(session)
         index_stmts = fetch_indexes(session)
 
-    schema_path = "schema.cypher"
     with open(schema_path, "w") as f:
         if constraint_stmts:
             f.write("// Constraints\n")
