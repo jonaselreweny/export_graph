@@ -1,6 +1,7 @@
 """Export a Neo4j property graph to Parquet files (nodes + relationships) and schema."""
 
 import argparse
+import getpass
 import json
 import os
 import time
@@ -8,11 +9,12 @@ from collections.abc import Generator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
-URI = "bolt+ssc://localhost:7687"
-AUTH = ("neo4j", "test1234")
-DATABASE = "paysim"  # set to None to use the default database
+DEFAULT_URI = "bolt://localhost:7687"
+DEFAULT_USERNAME = "neo4j"
+DEFAULT_DATABASE = "neo4j"
 DEFAULT_BATCH_SIZE = 50_000
 
 
@@ -172,6 +174,30 @@ def parse_args() -> argparse.Namespace:
         description="Export a Neo4j property graph to Parquet files and schema."
     )
     parser.add_argument(
+        "-a", "--address",
+        type=str,
+        default=None,
+        help=f"Neo4j URI (default: {DEFAULT_URI}). Env: NEO4J_URI",
+    )
+    parser.add_argument(
+        "-u", "--username",
+        type=str,
+        default=None,
+        help=f"Neo4j username (default: {DEFAULT_USERNAME}). Env: NEO4J_USERNAME",
+    )
+    parser.add_argument(
+        "-p", "--password",
+        type=str,
+        default=None,
+        help="Neo4j password. Env: NEO4J_PASSWORD. Prompted if not set.",
+    )
+    parser.add_argument(
+        "-d", "--database",
+        type=str,
+        default=None,
+        help=f"Neo4j database (default: {DEFAULT_DATABASE}). Env: NEO4J_DATABASE",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
@@ -186,8 +212,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_config(args: argparse.Namespace) -> dict:
+    """Resolve Neo4j connection config with precedence: CLI > env vars / .env > defaults."""
+    load_dotenv()  # loads .env if present; does not override existing env vars
+
+    uri = args.address or os.getenv("NEO4J_URI", DEFAULT_URI)
+    username = args.username or os.getenv("NEO4J_USERNAME", DEFAULT_USERNAME)
+    password = args.password or os.getenv("NEO4J_PASSWORD")
+    database = args.database or os.getenv("NEO4J_DATABASE", DEFAULT_DATABASE)
+
+    if not password:
+        password = getpass.getpass(prompt="Neo4j password: ")
+
+    return {
+        "uri": uri,
+        "username": username,
+        "password": password,
+        "database": database,
+    }
+
+
 def main() -> None:
     args = parse_args()
+    config = resolve_config(args)
     batch_size: int = args.batch_size
 
     nodes_path = "nodes.parquet"
@@ -196,11 +243,11 @@ def main() -> None:
 
     _check_output_files([nodes_path, rels_path, schema_path], args.overwrite)
 
-    driver = GraphDatabase.driver(URI, auth=AUTH)
+    driver = GraphDatabase.driver(config["uri"], auth=(config["username"], config["password"]))
     driver.verify_connectivity()
-    print(f"Connected to Neo4j.  Batch size: {batch_size}")
+    print(f"Connected to Neo4j ({config['uri']}, db={config['database']}).  Batch size: {batch_size}")
 
-    with driver.session(database=DATABASE) as session:
+    with driver.session(database=config["database"]) as session:
         # --- Nodes ---
         total_nodes = 0
         nodes_start = time.perf_counter()
