@@ -76,10 +76,10 @@ def fetch_constraints(session) -> list[str]:
 
 
 def fetch_indexes(session) -> list[str]:
-    """Return CREATE statements for indexes that are NOT owned by a constraint."""
+    """Return CREATE statements for indexes not owned by a constraint and not LOOKUP indexes."""
     result = session.run(
-        "SHOW INDEXES YIELD owningConstraint, createStatement "
-        "WHERE owningConstraint IS NULL "
+        "SHOW INDEXES YIELD type, owningConstraint, createStatement "
+        "WHERE owningConstraint IS NULL AND type <> 'LOOKUP' "
         "RETURN createStatement"
     )
     return [record["createStatement"] for record in result]
