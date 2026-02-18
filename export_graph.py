@@ -38,28 +38,32 @@ RELATIONSHIPS_SCHEMA = pa.schema(
 
 def fetch_nodes(session, batch_size: int = 1000) -> Generator[pa.Table, None, None]:
     """Yield batches of nodes as PyArrow tables with columns: id, labels, properties."""
-    skip = 0
-    while True:
-        result = session.run(
-            "MATCH (n) "
-            "RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props "
-            "ORDER BY elementId(n) "
-            "SKIP $skip LIMIT $limit",
-            skip=skip,
-            limit=batch_size,
-        )
-        ids: list[str] = []
-        labels: list[str] = []
-        properties: list[str] = []
+    result = session.run(
+        "MATCH (n) "
+        "RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props"
+    )
+    ids: list[str] = []
+    labels: list[str] = []
+    properties: list[str] = []
 
-        for record in result:
-            ids.append(record["id"])
-            labels.append(json.dumps(record["labels"]))
-            properties.append(_serialize_props(record["props"]))
+    for record in result:
+        ids.append(record["id"])
+        labels.append(json.dumps(record["labels"]))
+        properties.append(_serialize_props(record["props"]))
 
-        if not ids:
-            break
+        if len(ids) >= batch_size:
+            yield pa.table(
+                {
+                    "id": pa.array(ids, type=pa.string()),
+                    "labels": pa.array(labels, type=pa.string()),
+                    "properties": pa.array(properties, type=pa.string()),
+                }
+            )
+            ids.clear()
+            labels.clear()
+            properties.clear()
 
+    if ids:
         yield pa.table(
             {
                 "id": pa.array(ids, type=pa.string()),
@@ -67,38 +71,43 @@ def fetch_nodes(session, batch_size: int = 1000) -> Generator[pa.Table, None, No
                 "properties": pa.array(properties, type=pa.string()),
             }
         )
-        skip += batch_size
 
 
 def fetch_relationships(
     session, batch_size: int = 1000
 ) -> Generator[pa.Table, None, None]:
     """Yield batches of relationships as PyArrow tables with columns: outId, inId, type, properties."""
-    skip = 0
-    while True:
-        result = session.run(
-            "MATCH (a)-[r]->(b) "
-            "RETURN elementId(a) AS outId, elementId(b) AS inId, "
-            "type(r) AS type, properties(r) AS props "
-            "ORDER BY elementId(r) "
-            "SKIP $skip LIMIT $limit",
-            skip=skip,
-            limit=batch_size,
-        )
-        out_ids: list[str] = []
-        in_ids: list[str] = []
-        types: list[str] = []
-        properties: list[str] = []
+    result = session.run(
+        "MATCH (a)-[r]->(b) "
+        "RETURN elementId(a) AS outId, elementId(b) AS inId, "
+        "type(r) AS type, properties(r) AS props"
+    )
+    out_ids: list[str] = []
+    in_ids: list[str] = []
+    types: list[str] = []
+    properties: list[str] = []
 
-        for record in result:
-            out_ids.append(record["outId"])
-            in_ids.append(record["inId"])
-            types.append(record["type"])
-            properties.append(_serialize_props(record["props"]))
+    for record in result:
+        out_ids.append(record["outId"])
+        in_ids.append(record["inId"])
+        types.append(record["type"])
+        properties.append(_serialize_props(record["props"]))
 
-        if not out_ids:
-            break
+        if len(out_ids) >= batch_size:
+            yield pa.table(
+                {
+                    "outId": pa.array(out_ids, type=pa.string()),
+                    "inId": pa.array(in_ids, type=pa.string()),
+                    "type": pa.array(types, type=pa.string()),
+                    "properties": pa.array(properties, type=pa.string()),
+                }
+            )
+            out_ids.clear()
+            in_ids.clear()
+            types.clear()
+            properties.clear()
 
+    if out_ids:
         yield pa.table(
             {
                 "outId": pa.array(out_ids, type=pa.string()),
@@ -107,7 +116,6 @@ def fetch_relationships(
                 "properties": pa.array(properties, type=pa.string()),
             }
         )
-        skip += batch_size
 
 
 def fetch_constraints(session) -> list[str]:
