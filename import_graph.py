@@ -85,18 +85,28 @@ def _build_rel_set_clause(prop_types: dict) -> str:
 
 
 def ensure_database(driver, database: str) -> None:
-    """Create the database if it does not already exist."""
-    with driver.session(database="system") as session:
-        result = session.run(
-            "SHOW DATABASES YIELD name WHERE name = $name RETURN name",
-            name=database,
+    """Create the database if it does not already exist.
+
+    On Community Edition (no multi-database support) this is a no-op.
+    """
+    try:
+        with driver.session(database="system") as session:
+            result = session.run(
+                "SHOW DATABASES YIELD name WHERE name = $name RETURN name",
+                name=database,
+            )
+            if not result.single():
+                print(f"Database '{database}' does not exist — creating …")
+                session.run(f"CREATE DATABASE `{database}` WAIT") # parameterize to avoid injection risk
+                print(f"Database '{database}' created.")
+            else:
+                print(f"Database '{database}' already exists.")
+    except Exception as exc:
+        print(
+            f"Could not check/create database '{database}' "
+            f"(may be Community Edition): {exc}"
         )
-        if not result.single():
-            print(f"Database '{database}' does not exist — creating …")
-            session.run(f"CREATE DATABASE `{database}` WAIT")
-            print(f"Database '{database}' created.")
-        else:
-            print(f"Database '{database}' already exists.")
+        print("Continuing — assuming the database exists.") # Improve by catching specific exceptions or checking server version
 
 
 def apply_schema(session, schema_path: str) -> int:
@@ -158,7 +168,8 @@ def import_nodes(session, df: pd.DataFrame, batch_size: int) -> int:
             "  WITH row, row.labels AS lbls "
             "  CALL apoc.create.node(lbls, row.props) YIELD node "
             "  SET node._import_id = row.id "
-            "} IN TRANSACTIONS OF $batchSize ROWS",
+            "  RETURN node "
+            "} IN TRANSACTIONS OF $batchSize ROWS RETURN count(*)",
             rows=rows,
             batchSize=batch_size,
         )
@@ -204,7 +215,7 @@ def import_relationships(session, df: pd.DataFrame, batch_size: int) -> int:
             "  MATCH (b {_import_id: row.inId}) "
             "  CALL apoc.create.relationship(a, row.type, row.props, b) YIELD rel "
             "  RETURN rel "
-            "} IN TRANSACTIONS OF $batchSize ROWS",
+            "} IN TRANSACTIONS OF $batchSize ROWS RETURN count(*)",
             rows=rows,
             batchSize=batch_size,
         )

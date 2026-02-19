@@ -1,4 +1,5 @@
-neo4j
+# neo4j
+neo4j-rust-ext
 pyarrow
 pandas
 python-dotenv
