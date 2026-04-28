@@ -14,3 +14,6 @@ build/
 # Generated output
 *.parquet
 *.cypher
+
+# Repository metadata not intended for versioning
+.github/
