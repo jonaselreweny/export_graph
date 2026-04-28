@@ -3,6 +3,7 @@
 Export a Neo4j property graph to Parquet files and import it back into Neo4j.
 
 This project includes:
+
 - `export_graph.py`: Exports nodes, relationships, and schema
 - `import_graph.py`: Imports nodes, relationships, and schema
 - `read_parquet.py`: Quick local inspection of exported Parquet files
@@ -30,6 +31,7 @@ cp .env.example .env
 ```
 
 Environment variables:
+
 - `NEO4J_URI` (default: `bolt://localhost:7687`)
 - `NEO4J_USERNAME` (default: `neo4j`)
 - `NEO4J_PASSWORD` (prompted if empty)
@@ -55,6 +57,7 @@ python export_graph.py --output-dir output --batch-size 50000 --overwrite
 ```
 
 Produced files:
+
 - `nodes.parquet`
 - `relationships.parquet`
 - `schema.cypher`
@@ -74,6 +77,7 @@ python import_graph.py --input-dir output --database neo4j --batch-size 50000
 ```
 
 Import flow:
+
 - Ensures target database exists (when supported)
 - Applies schema statements from `schema.cypher`
 - Imports nodes and relationships from Parquet
@@ -89,6 +93,7 @@ python read_parquet.py
 
 ## Notes
 
+- Suitable for small to medium graphs. For larger graphs, consider alternative approaches.
 - Export stores properties and property types as JSON strings in Parquet columns.
 - Import reconstructs properties and applies type casting for Neo4j temporal/spatial types.
-- Large graphs can be tuned with `--batch-size`.
+- Batch size can be tuned with `--batch-size`.
