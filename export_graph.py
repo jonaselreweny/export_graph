@@ -11,16 +11,58 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
+from neo4j.spatial import Point, WGS84Point
 
 DEFAULT_URI = "bolt://localhost:7687"
 DEFAULT_USERNAME = "neo4j"
 DEFAULT_DATABASE = "neo4j"
-DEFAULT_BATCH_SIZE = 50_000
+DEFAULT_BATCH_SIZE = 5_000
 
 
 def _serialize_props(props: dict) -> str:
     """Convert a property dict to a JSON string for the parquet column."""
-    return json.dumps(props, default=str)
+
+    def _to_json_value(value):
+        if isinstance(value, Point):
+            point_map: dict[str, float | int] = {"srid": value.srid}
+            if isinstance(value, WGS84Point):
+                point_map["longitude"] = float(value.longitude)
+                point_map["latitude"] = float(value.latitude)
+                if len(value) == 3:
+                    point_map["height"] = float(value[2])
+            else:
+                point_map["x"] = float(value.x)
+                point_map["y"] = float(value.y)
+                if len(value) == 3:
+                    point_map["z"] = float(value[2])
+            return point_map
+
+        if isinstance(value, dict):
+            return {k: _to_json_value(v) for k, v in value.items()}
+
+        if isinstance(value, list):
+            return [_to_json_value(v) for v in value]
+
+        return value
+
+    return json.dumps(_to_json_value(props), default=str)
+
+
+def _serialize_prop_types(props: dict, prop_types: dict) -> str:
+    """Serialize property types using the same key order as properties when possible."""
+    ordered_prop_types: dict = {}
+
+    # First, follow the key order from the properties map for readability.
+    for key in props:
+        if key in prop_types:
+            ordered_prop_types[key] = prop_types[key]
+
+    # Then append any extra type keys that were not present in properties.
+    for key, value in prop_types.items():
+        if key not in ordered_prop_types:
+            ordered_prop_types[key] = value
+
+    return json.dumps(ordered_prop_types)
 
 
 NODES_SCHEMA = pa.schema(
@@ -60,7 +102,7 @@ def fetch_nodes(session, batch_size: int = DEFAULT_BATCH_SIZE) -> Generator[pa.T
         ids.append(record["id"])
         labels.append(json.dumps(record["labels"]))
         properties.append(_serialize_props(record["props"]))
-        property_types.append(json.dumps(record["propTypes"]))
+        property_types.append(_serialize_prop_types(record["props"], record["propTypes"]))
 
         if len(ids) >= batch_size:
             yield pa.table(
@@ -108,7 +150,7 @@ def fetch_relationships(
         in_ids.append(record["inId"])
         types.append(record["type"])
         properties.append(_serialize_props(record["props"]))
-        property_types.append(json.dumps(record["propTypes"]))
+        property_types.append(_serialize_prop_types(record["props"], record["propTypes"]))
 
         if len(out_ids) >= batch_size:
             yield pa.table(

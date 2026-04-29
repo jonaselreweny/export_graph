@@ -9,10 +9,12 @@ import time
 import pandas as pd
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
+from neo4j.spatial import CartesianPoint, WGS84Point
 
 DEFAULT_URI = "bolt://localhost:7687"
 DEFAULT_USERNAME = "neo4j"
-DEFAULT_BATCH_SIZE = 50_000
+DEFAULT_BATCH_SIZE = 5_000
+TEMP_IMPORT_LABEL = "__ImportNode"
 
 # Map Neo4j type names (from apoc.meta.cypher.types) to Cypher cast expressions.
 # Keys that are not found here are treated as STRING (no cast needed).
@@ -34,9 +36,70 @@ def _cast_properties(props: dict, prop_types: dict) -> dict:
     """Return a new dict with values cast to their Neo4j types where possible.
 
     For types that survive JSON round-tripping natively (INTEGER, FLOAT, BOOLEAN)
-    the Python driver will handle the conversion.  For temporal and spatial types
-    we keep the string representation and let the Cypher query cast them.
+    the Python driver will handle the conversion.
+
+    POINT values are converted to Neo4j spatial point objects so they are stored
+    as POINT in the graph instead of plain lists.
     """
+
+    def _to_point(value):
+        if isinstance(value, dict):
+            srid = value.get("srid")
+
+            if srid in (4326, 4979):
+                if "longitude" in value and "latitude" in value:
+                    if "height" in value:
+                        return WGS84Point((
+                            float(value["longitude"]),
+                            float(value["latitude"]),
+                            float(value["height"]),
+                        ))
+                    return WGS84Point((
+                        float(value["longitude"]),
+                        float(value["latitude"]),
+                    ))
+
+            if srid in (7203, 9157):
+                if "x" in value and "y" in value:
+                    if "z" in value:
+                        return CartesianPoint((
+                            float(value["x"]),
+                            float(value["y"]),
+                            float(value["z"]),
+                        ))
+                    return CartesianPoint((
+                        float(value["x"]),
+                        float(value["y"]),
+                    ))
+
+            if "longitude" in value and "latitude" in value:
+                if "height" in value:
+                    return WGS84Point((
+                        float(value["longitude"]),
+                        float(value["latitude"]),
+                        float(value["height"]),
+                    ))
+                return WGS84Point((
+                    float(value["longitude"]),
+                    float(value["latitude"]),
+                ))
+            if "x" in value and "y" in value:
+                if "z" in value:
+                    return CartesianPoint((
+                        float(value["x"]),
+                        float(value["y"]),
+                        float(value["z"]),
+                    ))
+                return CartesianPoint((
+                    float(value["x"]),
+                    float(value["y"]),
+                ))
+
+        if isinstance(value, (list, tuple)) and len(value) in (2, 3):
+            return CartesianPoint(tuple(float(v) for v in value))
+
+        return value
+
     cast = {}
     for key, value in props.items():
         neo4j_type = prop_types.get(key, "STRING")
@@ -46,8 +109,10 @@ def _cast_properties(props: dict, prop_types: dict) -> dict:
             cast[key] = float(value)
         elif neo4j_type in ("BOOLEAN",) and isinstance(value, bool):
             cast[key] = value
+        elif neo4j_type == "POINT":
+            cast[key] = _to_point(value)
         else:
-            # Keep as-is; temporal/spatial/string values stay as strings.
+            # Keep as-is for non-primitive cast types.
             cast[key] = value
     return cast
 
@@ -85,7 +150,7 @@ def _build_rel_set_clause(prop_types: dict) -> str:
 
 
 def ensure_database(driver, database: str) -> None:
-    """Create the database if it does not already exist.
+    """Create the database if it does not already exist. Exit if it already exists.
 
     On Community Edition (no multi-database support) this is a no-op.
     """
@@ -97,16 +162,18 @@ def ensure_database(driver, database: str) -> None:
             )
             if not result.single():
                 print(f"Database '{database}' does not exist — creating …")
-                session.run(f"CREATE DATABASE `{database}` WAIT") # parameterize to avoid injection risk
+                session.run(f"CREATE DATABASE `{database}` WAIT")
                 print(f"Database '{database}' created.")
             else:
-                print(f"Database '{database}' already exists.")
+                raise SystemExit(f"Database '{database}' already exists. Aborting to avoid overwriting data.")
+    except SystemExit:
+        raise
     except Exception as exc:
         print(
             f"Could not check/create database '{database}' "
             f"(may be Community Edition): {exc}"
         )
-        print("Continuing — assuming the database exists.") # Improve by catching specific exceptions or checking server version
+        print("Continuing — assuming the database does not exist.")
 
 
 def apply_schema(session, schema_path: str) -> int:
@@ -145,34 +212,26 @@ def import_nodes(session, df: pd.DataFrame, batch_size: int) -> int:
 
     for i in range(0, len(df), batch_size):
         batch_df = df.iloc[i : i + batch_size]
-        rows: list[dict] = []
-
-        for _, row in batch_df.iterrows():
-            props = json.loads(row["properties"])
-            prop_types = json.loads(row["property_types"]) if row.get("property_types") else {}
-            cast_props = _cast_properties(props, prop_types)
-            labels_list: list[str] = json.loads(row["labels"])
-            rows.append({
-                "id": row["id"],
-                "labels": labels_list,
-                "props": cast_props,
-                "propTypes": prop_types,
-            })
-
-        # Collect all distinct property type maps to build targeted SET clauses.
-        # For simplicity and to handle heterogeneous nodes, we use SET n += $props
-        # and wrap temporal casts at the Cypher level per unique type signature.
+        props_series = batch_df["properties"].map(json.loads)
+        types_series = batch_df["property_types"].map(
+            lambda v: json.loads(v) if v else {}
+        )
+        labels_series = batch_df["labels"].map(json.loads)
+        rows = [
+            {
+                "labels": labels,
+                "props": {**_cast_properties(props, prop_types), "_import_id": row_id},
+            }
+            for row_id, labels, props, prop_types in zip(
+                batch_df["id"], labels_series, props_series, types_series
+            )
+        ]
         session.run(
             "UNWIND $rows AS row "
-            "CALL { WITH row "
-            "  WITH row, row.labels AS lbls "
-            "  CALL apoc.create.node(lbls, row.props) YIELD node "
-            "  SET node._import_id = row.id "
-            "  RETURN node "
-            "} IN TRANSACTIONS OF $batchSize ROWS RETURN count(*)",
+            f"CREATE (node:{TEMP_IMPORT_LABEL}:$(row.labels)) "
+            "   SET node = row.props ",
             rows=rows,
-            batchSize=batch_size,
-        )
+        ).consume()
 
         batch_count = len(batch_df)
         total += batch_count
@@ -195,30 +254,30 @@ def import_relationships(session, df: pd.DataFrame, batch_size: int) -> int:
 
     for i in range(0, len(df), batch_size):
         batch_df = df.iloc[i : i + batch_size]
-        rows: list[dict] = []
-
-        for _, row in batch_df.iterrows():
-            props = json.loads(row["properties"])
-            prop_types = json.loads(row["property_types"]) if row.get("property_types") else {}
-            cast_props = _cast_properties(props, prop_types)
-            rows.append({
-                "outId": row["outId"],
-                "inId": row["inId"],
-                "type": row["type"],
-                "props": cast_props,
-            })
-
+        props_series = batch_df["properties"].map(json.loads)
+        types_series = batch_df["property_types"].map(
+            lambda v: json.loads(v) if v else {}
+        )
+        rows = [
+            {
+                "outId": out_id,
+                "inId": in_id,
+                "type": rel_type,
+                "props": _cast_properties(props, prop_types),
+            }
+            for out_id, in_id, rel_type, props, prop_types in zip(
+                batch_df["outId"], batch_df["inId"], batch_df["type"],
+                props_series, types_series
+            )
+        ]
         session.run(
             "UNWIND $rows AS row "
-            "CALL { WITH row "
-            "  MATCH (a {_import_id: row.outId}) "
-            "  MATCH (b {_import_id: row.inId}) "
-            "  CALL apoc.create.relationship(a, row.type, row.props, b) YIELD rel "
-            "  RETURN rel "
-            "} IN TRANSACTIONS OF $batchSize ROWS RETURN count(*)",
+            f"MATCH (a:{TEMP_IMPORT_LABEL} {{_import_id: row.outId}}) "
+            f"MATCH (b:{TEMP_IMPORT_LABEL} {{_import_id: row.inId}}) "
+            "CREATE (a)-[rel:$(row.type)]->(b) "
+            "  SET rel = row.props ",
             rows=rows,
-            batchSize=batch_size,
-        )
+        ).consume()
 
         batch_count = len(batch_df)
         total += batch_count
@@ -233,15 +292,16 @@ def import_relationships(session, df: pd.DataFrame, batch_size: int) -> int:
     return total
 
 
-def cleanup_import_ids(session) -> None:
-    """Remove the temporary _import_id property from all nodes."""
-    print("Cleaning up temporary _import_id properties …")
+def cleanup_import_ids(session, batch_size: int) -> None:
+    """Remove temporary import label and _import_id property from imported nodes."""
+    print("Cleaning up temporary import label/properties …")
     session.run(
-        "CALL apoc.periodic.iterate("
-        "  'MATCH (n) WHERE n._import_id IS NOT NULL RETURN n', "
-        "  'REMOVE n._import_id', "
-        "  {batchSize: 10000, parallel: false}"
-        ")"
+        f"MATCH (n:{TEMP_IMPORT_LABEL}) "
+        "CALL (n) { "
+        "  REMOVE n._import_id "
+        f"  REMOVE n:{TEMP_IMPORT_LABEL} "
+        "} IN TRANSACTIONS OF $batchSize ROWS RETURN count(*)",
+        batchSize=batch_size
     )
     print("Cleanup complete.")
 
@@ -339,42 +399,58 @@ def main() -> None:
     # --- Create database if needed ---
     ensure_database(driver, config["database"])
 
-    with driver.session(database=config["database"]) as session:
-        # --- Schema ---
-        schema_count = apply_schema(session, schema_path)
-        print(f"Applied {schema_count} schema statement(s) from {schema_path}")
+    try:
+        with driver.session(database=config["database"]) as session:
+            # --- Schema ---
+            schema_count = apply_schema(session, schema_path)
+            print(f"Applied {schema_count} schema statement(s) from {schema_path}")
 
-        # --- Temporary index for _import_id lookups ---
-        print("Creating temporary index on _import_id …")
+            # --- Nodes ---
+            print(f"Reading {nodes_path} …")
+            nodes_df = pd.read_parquet(nodes_path)
+            import_nodes(session, nodes_df, batch_size)
+
+            # --- Temporary index for _import_id lookups (built after nodes exist) ---
+            print("Creating temporary index on _import_id …")
+            try:
+                session.run(
+                    "CREATE INDEX _import_id_index IF NOT EXISTS "
+                    f"FOR (n:{TEMP_IMPORT_LABEL}) ON (n._import_id)"
+                ).consume()
+                # Wait for the index to come online before using it.
+                session.run("CALL db.awaitIndexes(300)").consume()
+                print("  Index online.")
+            except Exception:
+                print("  Could not create temporary _import_id index — continuing without it.")
+
+            # --- Relationships ---
+            print(f"Reading {rels_path} …")
+            rels_df = pd.read_parquet(rels_path)
+            import_relationships(session, rels_df, batch_size)
+
+            # --- Cleanup ---
+            cleanup_import_ids(session, batch_size)
+
+            # Drop temporary index.
+            try:
+                session.run("DROP INDEX _import_id_index IF EXISTS").consume()
+                print("Dropped temporary _import_id index.")
+            except Exception:
+                pass
+
+    except Exception as exc:
+        print(f"\nImport failed: {exc}")
+        print(f"Dropping partially-created database '{config['database']}' to allow a clean re-run …")
         try:
-            session.run(
-                "CREATE INDEX _import_id_index IF NOT EXISTS "
-                "FOR (n:__ALL__) ON (n._import_id)"
-            )
-        except Exception:
-            # Fallback: some Neo4j versions don't support __ALL__ label.
-            # The import will still work, just slower on relationship matching.
-            print("  Could not create universal _import_id index — continuing without it.")
-
-        # --- Nodes ---
-        print(f"Reading {nodes_path} …")
-        nodes_df = pd.read_parquet(nodes_path)
-        import_nodes(session, nodes_df, batch_size)
-
-        # --- Relationships ---
-        print(f"Reading {rels_path} …")
-        rels_df = pd.read_parquet(rels_path)
-        import_relationships(session, rels_df, batch_size)
-
-        # --- Cleanup ---
-        cleanup_import_ids(session)
-
-        # Drop temporary index.
-        try:
-            session.run("DROP INDEX _import_id_index IF EXISTS")
-            print("Dropped temporary _import_id index.")
-        except Exception:
-            pass
+            with driver.session(database="system") as sys_session:
+                sys_session.run(
+                    f"DROP DATABASE `{config['database']}` IF EXISTS"
+                ).consume()
+            print("Database dropped.")
+        except Exception as drop_exc:
+            print(f"  Could not drop database: {drop_exc}")
+        driver.close()
+        raise SystemExit(1) from exc
 
     driver.close()
     print("Import complete.")

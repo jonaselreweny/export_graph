@@ -53,7 +53,7 @@ python export_graph.py
 Useful flags:
 
 ```bash
-python export_graph.py --output-dir output --batch-size 50000 --overwrite
+python export_graph.py --output-dir output --batch-size 5000 --overwrite
 ```
 
 Produced files:
@@ -73,7 +73,7 @@ python import_graph.py
 Useful flags:
 
 ```bash
-python import_graph.py --input-dir output --database neo4j --batch-size 50000
+python import_graph.py --input-dir output --database neo4j --batch-size 5000
 ```
 
 Import flow:
