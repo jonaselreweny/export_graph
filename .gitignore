@@ -17,3 +17,6 @@ build/
 
 # Repository metadata not intended for versioning
 .github/
+
+# macOS
+.DS_Store
